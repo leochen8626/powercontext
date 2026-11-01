@@ -248,6 +248,11 @@ from powercontext.builtin.runtime.recall_sufficiency import (
     build_recall_candidates,
     recall_effort,
 )
+from powercontext.builtin.runtime.context_pack import (
+    ContextPack,
+    ContextPackDelta,
+    ContextPackError,
+)
 from powercontext.builtin.runtime.statistics import RelationalScopedStatistics, overview_selection
 from powercontext.builtin.scope import ScopeApplication, ScopeDescriptor, ScopeSelection
 from powercontext.builtin.scope.subject_sources import SubjectSourceService
@@ -883,6 +888,30 @@ class ScopedContextApplication:
                 if measurement is not None:
                     await self._runtime.statistics.for_scope(self.scope_id).record_recall(measurement)
         return build.context
+
+    async def prepare_incremental(
+        self,
+        request: PrepareContextRequest,
+        base_pack: ContextPack | None = None,
+    ) -> ContextPack | ContextPackDelta:
+        """Prepare the scoped context as a transport pack.
+
+        Without ``base_pack`` the full target content is returned as a
+        :class:`ContextPack`. When a legal ``base_pack`` (a previously sent full pack)
+        is supplied, an incremental :class:`ContextPackDelta` is returned instead so the
+        receiver can rebuild the identical target pack from the base plus the delta.
+        """
+        prepared = await self.prepare(request)
+        content = prepared.content
+        if content is None:
+            target = ContextPack.build(())
+        else:
+            target = ContextPack.from_content(content)
+        if base_pack is None:
+            return target
+        if not isinstance(base_pack, ContextPack):
+            raise ContextPackError("base_pack must be a ContextPack")
+        return ContextPackDelta.between(base_pack, target)
 
     async def _prepare_build(
         self,
