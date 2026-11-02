@@ -1180,6 +1180,35 @@ RECURRENCE_OBSERVATION_TABLE = Table(
 
 RECURRENCE_TABLES = (RECURRENCE_MATCH_TABLE, RECURRENCE_OBSERVATION_TABLE)
 
+SOURCE_LIFECYCLE_NODE_TABLE = Table(
+    "pc_source_lifecycle_nodes",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(255), primary_key=True),
+    Column("kind", identity_string(8), nullable=False),
+    Column("parents", Text, nullable=False),
+    Column("policy", identity_string(8), nullable=False),
+    Column("reference", Text, nullable=False),
+    Column("lifecycle_revision", Integer),
+    CheckConstraint("kind IN ('source', 'memory', 'topic')", name="ck_pc_source_lifecycle_node_kind"),
+    CheckConstraint("policy IN ('all', 'any', 'none')", name="ck_pc_source_lifecycle_node_policy"),
+)
+
+SOURCE_LIFECYCLE_EVENT_TABLE = Table(
+    "pc_source_lifecycle_events",
+    SHARED_METADATA,
+    Column("scope_id", identity_string(MAX_SCOPE_ID_LENGTH), primary_key=True),
+    Column("node_id", identity_string(255), primary_key=True),
+    Column("sequence", Integer, primary_key=True),
+    Column("revision", Integer, nullable=False),
+    Column("available", Boolean, nullable=False),
+    Column("reason", Text, nullable=False),
+    CheckConstraint("sequence > 0", name="ck_pc_source_lifecycle_event_sequence_positive"),
+    CheckConstraint("revision > 0", name="ck_pc_source_lifecycle_event_revision_positive"),
+)
+
+SOURCE_LIFECYCLE_TABLES = (SOURCE_LIFECYCLE_NODE_TABLE, SOURCE_LIFECYCLE_EVENT_TABLE)
+
 BUILTIN_TABLES = (
     SCOPE_TABLES
     + SHARED_TABLES
@@ -1187,5 +1216,6 @@ BUILTIN_TABLES = (
     + MEMORY_TABLES
     + STATISTICS_TABLES
     + RECURRENCE_TABLES
+    + SOURCE_LIFECYCLE_TABLES
     + (ARTIFACT_TAGS_TABLE, DREAM_RUNS_TABLE, RECEIPT_MIGRATION_REVIEW_TABLE)
 )

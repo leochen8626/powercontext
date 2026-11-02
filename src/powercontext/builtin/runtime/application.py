@@ -168,6 +168,10 @@ from powercontext.builtin.runtime._scope_cache import (
 )
 from powercontext.builtin.runtime.decision_model import DecisionModel
 from powercontext.builtin.runtime.errors import InvalidRuntimeRequestError, TopicMemoryProcessingUnavailableError
+from powercontext.builtin.runtime.source_lifecycle import (
+    SourceLifecycleApplication,
+    filter_inactive_topic_hits,
+)
 from powercontext.builtin.runtime.models import (
     ApproveArtifactCandidateRequest,
     CaptureSource,
@@ -2667,6 +2671,8 @@ class ScopedTopicMemoryApplication:
                     query_embedding,
                     embedding_timeout_seconds,
                 )
+        # Withdrawn Topic Memory support stays out of native search and Context.
+        result = await filter_inactive_topic_hits(self._runtime, self.scope_id, result)
         observer = self._runtime._topic_memory_search_observer
         if observer is not None:
             try:
@@ -3111,6 +3117,7 @@ class BuiltinRuntime:
         self.memory = MemoryApplication(self)
         self.topic_memory = TopicMemoryApplication(self)
         self.records = RecordApplication(self)
+        self.lifecycle = SourceLifecycleApplication(self)
         self.prompts = PromptApplication(self)
         self.review = ReviewApplication(self)
         self.skill = SkillApplication(self)
