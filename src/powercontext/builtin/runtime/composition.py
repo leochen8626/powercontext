@@ -596,6 +596,8 @@ async def open_builtin_runtime(
                     prompts=dict(contexts.prompt_registry.capabilities),
                 ),
                 source_window_limit=config.runtime.source_window_limit,
+                memory_source_count_threshold=config.runtime.memory_source_count_threshold,
+                topic_memory_source_count_threshold=config.runtime.topic_memory_source_count_threshold,
                 context_assembly_max_entries=config.runtime.context_assembly_max_entries,
                 recall_sufficiency_policy=RecallSufficiencyPolicy.from_runtime_config(config.runtime),
                 scope_cache_size=config.runtime.scope_cache_size,
@@ -657,6 +659,15 @@ async def open_builtin_runtime(
             _open_artifact_processing_supervisor(config, contexts, processing_bindings, tracing=tracing)
         )
         contexts.profiles.operation_context = runtime._operation
+        if (
+            config.runtime.memory_source_count_threshold is not None
+            or config.runtime.topic_memory_source_count_threshold is not None
+        ):
+            # Restart recovery: pending inputs below a threshold must stay pending, and
+            # inputs that already reached a threshold must resume processing even when no
+            # new capture arrives in this process.
+            for scope_id in await contexts.scope_ids():
+                await runtime._admit_by_count(scope_id)
         if config.handoff_report.enabled:
             runtime.handoff_report = HandoffReportApplication(
                 contexts.scopes,

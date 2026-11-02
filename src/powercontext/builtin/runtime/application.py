@@ -121,6 +121,7 @@ from powercontext.builtin.artifacts.topic_memory import (
     TopicMemorySearchMode,
     TopicMemorySearchResult,
 )
+from powercontext.builtin.triggers.source_window import SOURCE_WINDOW_TRIGGER_NAME
 from powercontext.builtin.code.application import CodeApplication
 from powercontext.builtin.code.errors import CodeError
 from powercontext.builtin.code.models import CodeConfig, CodeQueryRequest, CodeQueryResult
@@ -469,7 +470,11 @@ class ScopedSourceApplication:
         self.scope_id = validate_scope_id(scope_id)
 
     async def capture(self, value: CaptureSource, /) -> SourceReceipt:
-        return await self._capture(value)
+        receipt = await self._capture(value)
+        # Evaluate count thresholds after capture locks are released: reaching one starts
+        # the original processing call without an explicit flush or time condition.
+        await self._runtime._admit_by_count(self.scope_id)
+        return receipt
 
     async def _capture(self, value: CaptureSource, /, *, handoff_receipt: bool = False) -> SourceReceipt:
         if self._runtime._record_service is not None:
@@ -531,11 +536,14 @@ class ScopedRecordApplication:
         /,
     ) -> SourceRecord:
         async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
-            return await self._runtime._records().create_source(
+            record = await self._runtime._records().create_source(
                 self.scope_id,
                 source_type,
                 content,
             )
+        # Server Sources occupy a journal identity and participate in count thresholds.
+        await self._runtime._admit_by_count(self.scope_id)
+        return record
 
     async def get_source(self, source_type: str, source_id: str, /) -> SourceRecord:
         async with self._runtime._scope_operation(self.scope_id):
@@ -563,7 +571,11 @@ class ScopedRecordApplication:
         /,
     ) -> ArtifactCreated:
         async with self._runtime._scope_operation(self.scope_id), self._runtime._locked(self.scope_id):
-            return await self._runtime._records().create_artifact(self.scope_id, family, write)
+            created = await self._runtime._records().create_artifact(self.scope_id, family, write)
+        # Lineage-only server Sources appended by artifact writes occupy a journal
+        # identity and participate in count thresholds.
+        await self._runtime._admit_by_count(self.scope_id)
+        return created
 
     async def get_artifact(self, family: str, artifact_id: str, /) -> ArtifactRecord:
         async with self._runtime._scope_operation(self.scope_id):
@@ -3020,6 +3032,8 @@ class BuiltinRuntime:
         publication_application: ArtifactPublicationApplication | None = None,
         scope_application: ScopeApplication | None = None,
         readiness: RuntimeReadinessChecks | None = None,
+        memory_source_count_threshold: int | None = None,
+        topic_memory_source_count_threshold: int | None = None,
         clock: Clock | None = None,
         tracing: RuntimeTracing | None = None,
         scheduled_source_runner: ScheduledSourceRunner | None = None,
@@ -3082,6 +3096,8 @@ class BuiltinRuntime:
         self._tracing = tracing
         self._scheduled_source_runner = scheduled_source_runner
         self._scheduled_experience_runner = scheduled_experience_runner
+        self._memory_source_count_threshold = memory_source_count_threshold
+        self._topic_memory_source_count_threshold = topic_memory_source_count_threshold
         self.source_window_limit = source_window_limit
         self.context_assembly_max_entries = context_assembly_max_entries
         self.recall_sufficiency_policy = recall_sufficiency_policy
@@ -3360,6 +3376,52 @@ class BuiltinRuntime:
                 yield
             finally:
                 self._generation_owners.remove(task)
+
+    async def _admit_by_count(self, scope_id: str, /) -> None:
+        """Start one processing call for families whose pending count reached their threshold.
+
+        Pending sources are measured per scope and per processing family from the persisted
+        journal head minus that family's last successful cursor. Reaching a threshold accepts
+        exactly one original processing call (one Memory window / one Topic Memory wave); the
+        next capture, the existing time conditions, or an explicit flush decides any further
+        work. Failures are logged and retried by the next evaluation; no cursor is consumed.
+        """
+
+        memory_threshold = self._memory_source_count_threshold
+        topic_threshold = self._topic_memory_source_count_threshold
+        if memory_threshold is None and topic_threshold is None:
+            return
+        try:
+            memory_pending = 0
+            topic_pending = 0
+            async with self._context(scope_id) as context:
+                if memory_threshold is not None:
+                    memory_pending = await context.triggers.pending_source_count(
+                        scope_id,
+                        SOURCE_WINDOW_TRIGGER_NAME,
+                    )
+                if topic_threshold is not None:
+                    topic_pending = await context.triggers.pending_source_count(
+                        scope_id,
+                        TOPIC_MEMORY_SOURCE_WINDOW_BINDING,
+                    )
+            if memory_threshold is not None and memory_pending >= memory_threshold:
+                await self.memory.for_scope(scope_id).flush()
+            if topic_threshold is not None and topic_pending >= topic_threshold:
+                if self._topic_memory_processing_available and self._topic_memory_flush is not None:
+                    await self.topic_memory.for_scope(scope_id).flush()
+        except Exception as error:
+            log_safely(
+                logger,
+                logging.WARNING,
+                "Source count trigger evaluation failed",
+                exc_info=error,
+                extra={
+                    "event": "source.count_trigger.evaluation_failed",
+                    "outcome": "failure",
+                    "unit": "sources",
+                },
+            )
 
     @asynccontextmanager
     async def _context(

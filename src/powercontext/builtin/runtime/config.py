@@ -208,6 +208,8 @@ class RuntimeConfig(BaseModel):
     dream_budget: DreamBudget = Field(default_factory=DreamBudget)
     topic_memory_schedule_seconds: float | None = Field(default=None, gt=0)
     topic_memory_source_window_limit: int = Field(default=10, ge=1)
+    memory_source_count_threshold: int | None = Field(default=None, gt=0)
+    topic_memory_source_count_threshold: int | None = Field(default=None, gt=0)
     topic_memory_history_max_candidates: int = Field(default=20, ge=1, le=MAX_TOPIC_MEMORY_SEARCH_LIMIT)
     topic_memory_history_rrf_threshold: int = Field(default=70, ge=0, le=100)
     topic_memory_history_min_candidates: int = Field(default=5, ge=1, le=MAX_TOPIC_MEMORY_SEARCH_LIMIT)
@@ -229,6 +231,22 @@ class RuntimeConfig(BaseModel):
     model_usage_queue_capacity: int = Field(default=256, ge=1, le=16_384)
     model_usage_write_timeout_seconds: float = Field(default=1.0, gt=0, le=30)
     model_usage_flush_timeout_seconds: float = Field(default=0.5, gt=0, le=30)
+
+    @field_validator(
+        "memory_source_count_threshold",
+        "topic_memory_source_count_threshold",
+        mode="before",
+    )
+    @classmethod
+    def _validate_source_count_threshold(cls, value: Any) -> Any:
+        # Reject non-integer and boolean inputs; only strict positive integers or None pass.
+        if value is None:
+            return None
+        if isinstance(value, bool) or isinstance(value, str) or isinstance(value, float):
+            raise ValueError("source count threshold must be a strict positive integer or None")
+        if not isinstance(value, int):
+            raise ValueError("source count threshold must be a strict positive integer or None")
+        return value
 
     @model_validator(mode="after")
     def validate_topic_memory_history_candidates(self) -> RuntimeConfig:

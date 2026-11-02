@@ -1681,6 +1681,21 @@ class _RelationalTriggers:
             )
         return self._trigger.initial_state() if state is None else state.cursor
 
+    async def pending_source_count(self, scope_id: str, binding_name: str, /) -> int:
+        """Count persisted journal identities after a binding's last successful cursor.
+
+        The journal head is shared across families within one scope; each processing
+        family keeps its own cursor, so this measures only the unprocessed tail for the
+        requested binding (memory vs topic-memory).
+        """
+
+        scope_id = validate_scope_id(scope_id)
+        async with self._services.database.transaction() as connection:
+            head = await self._services.repositories.sources.journal_position(connection, scope_id)
+            cursor = await self._services.repositories.cursors.load(connection, scope_id, binding_name)
+            position = 0 if cursor is None else cursor.cursor.sequence
+        return max(0, head - position)
+
     @prompt_operation("memory.extract")
     async def flush(
         self,
