@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
+from math import log
 from typing import TypeVar
 
 from powercontext.artifacts import ArtifactAddress, ArtifactRef
@@ -106,6 +108,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple["PreparedContextFragment", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -118,6 +121,16 @@ class MemoryEntryAddress:
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
+
+
+@dataclass(frozen=True)
+class PreparedContextFragment:
+    """One verbatim evidence span selected from a Memory entry for the current query."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 @dataclass(frozen=True)
@@ -156,6 +169,7 @@ class PreparedContextBuilder:
     topic_memory_entry_limit = 8
     experience_entry_limit = 2
     max_entry_content_bytes = 2000
+    evidence_max_fragments = 32
     _text_entry_limit: int | None = None
 
     def empty(self) -> PreparedContext:
@@ -228,6 +242,9 @@ class PreparedContextBuilder:
 
             return assemble_code(request, code_candidates, self.entry_limit, historical)
 
+        if request.evidence_selection:
+            return self._build_evidence_selection(request=request, memory_candidates=memory_candidates)
+
         if sum(len(candidates.hits) for candidates in memory_candidates) > self.memory_candidate_limit:
             raise PreparedContextInvariantError("memory-candidate-limit")
         if len(topic_memory_hits) > self.topic_memory_candidate_limit:
@@ -292,6 +309,44 @@ class PreparedContextBuilder:
             truncated_items=omissions.truncated_items,
             dropped_items=omissions.dropped_items,
             unused_bytes=max(0, request.max_bytes - content_bytes),
+        )
+
+    def _build_evidence_selection(
+        self,
+        *,
+        request: PrepareContextRequest,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Select verbatim query-relevant fragments under the full output budget.
+
+        The whole rendered output — trust policy, envelope markers, JSON, citations, and
+        fragment text — is charged to ``max_bytes``; fragments are literal spans of the
+        original entry text with exact character offsets and scope-qualified addresses.
+        """
+        documents = _evidence_documents(memory_candidates)
+        spans = _select_evidence_spans(
+            query=request.query,
+            documents=documents,
+            max_bytes=request.max_bytes,
+            max_fragments=self.evidence_max_fragments,
+        )
+        if not spans:
+            return PreparedContextBuild(context=self.empty())
+        fragments = tuple(
+            PreparedContextFragment(
+                address=span.address,
+                start=span.start,
+                end=span.end,
+                text=documents[span.doc_index][1][span.start : span.end],
+            )
+            for span in spans
+        )
+        content = _render_evidence(fragments)
+        content_bytes = len(content.encode("utf-8"))
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
+            origins=tuple(fragment.address for fragment in fragments),
+            fragments=fragments,
         )
 
     def _select_entries(
@@ -728,3 +783,292 @@ def _truncate_utf8(text: str, byte_budget: int) -> str:
     prefix_budget = byte_budget - len(_ELLIPSIS.encode("utf-8"))
     encoded_prefix = text.encode("utf-8")[:prefix_budget]
     return f"{encoded_prefix.decode('utf-8', errors='ignore')}{_ELLIPSIS}"
+
+
+# ---------------------------------------------------------------------------
+# Query-driven evidence selection (verbatim fragments under a byte budget)
+# ---------------------------------------------------------------------------
+
+_EVIDENCE_TOKEN_RE = re.compile(r"[a-z]+|\d+")
+_EVIDENCE_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_EVIDENCE_SENTENCE_RE = re.compile(r"[^.!?。！？\n]+[.!?。！？]*")
+_EVIDENCE_ITEM_OVERHEAD_BYTES = 200
+
+
+@dataclass(frozen=True)
+class _EvidenceSpan:
+    """A selected verbatim span, tracked against its source document internally."""
+
+    address: MemoryEntryAddress
+    doc_index: int
+    start: int
+    end: int
+    score: float
+
+
+def _evidence_documents(
+    groups: Sequence[PreparedMemoryCandidates],
+) -> tuple[tuple[MemoryEntryAddress, str], ...]:
+    """Collect deduplicated candidate entries with scope-qualified addresses."""
+
+    documents: list[tuple[MemoryEntryAddress, str]] = []
+    for group in groups:
+        seen_entries: set[tuple[str, str]] = set()
+        for hit in group.hits:
+            key = (hit.entry_id, hit.entry_version_id)
+            if key in seen_entries or not hit.text.strip():
+                continue
+            seen_entries.add(key)
+            address = MemoryEntryAddress(
+                memory=ArtifactAddress(scope_id=group.scope_id, artifact=hit.memory_ref),
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
+            )
+            documents.append((address, hit.text))
+    return tuple(documents)
+
+
+def _evidence_sentences(text: str) -> tuple[tuple[int, int], ...]:
+    """Split text into trimmed sentence spans with exact character offsets."""
+
+    spans: list[tuple[int, int]] = []
+    for match in _EVIDENCE_SENTENCE_RE.finditer(text):
+        start, end = match.start(), match.end()
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if end > start:
+            spans.append((start, end))
+    return tuple(spans)
+
+
+def _evidence_span_bytes(documents: Sequence[tuple[MemoryEntryAddress, str]], span: _EvidenceSpan) -> int:
+    return len(documents[span.doc_index][1][span.start : span.end].encode("utf-8"))
+
+
+def _render_evidence(fragments: Sequence[PreparedContextFragment]) -> str:
+    """Render the final envelope; the runner parses the second-to-last line as JSON."""
+
+    items = []
+    for fragment in fragments:
+        address = fragment.address
+        items.append(
+            {
+                "citation": {
+                    "scope_id": address.memory.scope_id,
+                    "memory_ref": address.memory.artifact.model_dump(mode="json"),
+                    "entry_id": address.entry_id,
+                    "entry_version_id": address.entry_version_id,
+                },
+                "content": fragment.text,
+                "start": fragment.start,
+                "end": fragment.end,
+            }
+        )
+    envelope = {"trust": "untrusted_history", "items": items}
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+def _render_evidence_spans(
+    documents: Sequence[tuple[MemoryEntryAddress, str]],
+    spans: Sequence[_EvidenceSpan],
+) -> int:
+    """UTF-8 byte size of the full output for the given spans, merged as they would ship.
+
+    Merging before measuring matters: adjacent spans share one citation instead of paying
+    the per-item overhead separately, so the measured budget reflects the final output and
+    greedy passes neither overpay for unmerged neighbours nor stop expanding too early.
+    """
+
+    merged = _merge_evidence_spans(documents, spans)
+    fragments = tuple(
+        PreparedContextFragment(
+            address=span.address,
+            start=span.start,
+            end=span.end,
+            text=documents[span.doc_index][1][span.start : span.end],
+        )
+        for span in merged
+    )
+    return len(_render_evidence(fragments).encode("utf-8"))
+
+
+def _merge_evidence_spans(
+    documents: Sequence[tuple[MemoryEntryAddress, str]],
+    spans: Sequence[_EvidenceSpan],
+) -> tuple[_EvidenceSpan, ...]:
+    """Sort spans and merge ones that overlap or touch across whitespace only."""
+
+    by_doc: dict[int, list[_EvidenceSpan]] = {}
+    for span in spans:
+        by_doc.setdefault(span.doc_index, []).append(span)
+    merged: list[_EvidenceSpan] = []
+    for doc_index in sorted(by_doc):
+        ordered = sorted(by_doc[doc_index], key=lambda span: (span.start, span.end))
+        text = documents[doc_index][1]
+        current = ordered[0]
+        for candidate in ordered[1:]:
+            gap_whitespace = text[current.end : candidate.start].isspace()
+            if candidate.start <= current.end or gap_whitespace:
+                current = replace(
+                    current,
+                    end=max(current.end, candidate.end),
+                    score=current.score + candidate.score,
+                )
+            else:
+                merged.append(current)
+                current = candidate
+        merged.append(current)
+    return tuple(sorted(merged, key=lambda span: (span.doc_index, span.start)))
+
+
+def _select_evidence_spans(
+    *,
+    query: str,
+    documents: Sequence[tuple[MemoryEntryAddress, str]],
+    max_bytes: int,
+    max_fragments: int,
+) -> tuple[_EvidenceSpan, ...]:
+    """Pick query-relevant verbatim sentences, then widen them under the budget.
+
+    Selection is greedy on evidence value per byte (including the fixed per-item
+    citation overhead), with same-document diversity so evidence spread across
+    several candidate entries is reached before one entry is exhausted. Leftover
+    budget widens selected fragments into neighbouring sentences, which lets
+    several fragments jointly cover one contiguous evidence region.
+    """
+
+    if not documents:
+        return ()
+
+    query_lower = query.lower()
+    query_tokens = _EVIDENCE_TOKEN_RE.findall(query_lower)
+    query_cjk = sorted(set(_EVIDENCE_CJK_RE.findall(query)))
+
+    doc_count = len(documents)
+    document_tokens = [set(_EVIDENCE_TOKEN_RE.findall(text.lower())) for _, text in documents]
+    df: dict[str, int] = {}
+    for token in set(query_tokens):
+        df[token] = sum(1 for tokens in document_tokens if token in tokens)
+    idf = {token: log(1 + doc_count / (1 + df[token])) for token in set(query_tokens)}
+
+    sentences: list[dict[str, object]] = []
+    doc_sentences: list[list[dict[str, object]]] = []
+    seen_sentence_text: set[str] = set()
+    for doc_index, (address, text) in enumerate(documents):
+        per_doc: list[dict[str, object]] = []
+        for start, end in _evidence_sentences(text):
+            sentence_text = text[start:end]
+            dedupe_key = " ".join(sentence_text.lower().split())
+            if dedupe_key in seen_sentence_text:
+                per_doc.append(None)  # keep positional alignment for neighbours
+                continue
+            seen_sentence_text.add(dedupe_key)
+            tokens: dict[str, int] = {}
+            for token in _EVIDENCE_TOKEN_RE.findall(sentence_text.lower()):
+                tokens[token] = tokens.get(token, 0) + 1
+            score = 0.0
+            for token in set(query_tokens):
+                if token in tokens:
+                    score += idf[token] * min(tokens[token], 3)
+            for char in query_cjk:
+                count = sentence_text.count(char)
+                if count:
+                    score += min(count, 3)
+            sentence = {
+                "address": address,
+                "doc_index": doc_index,
+                "start": start,
+                "end": end,
+                "score": score,
+                "priority": score,
+            }
+            sentences.append(sentence)
+            per_doc.append(sentence)
+        doc_sentences.append(per_doc)
+
+    def span_of(sentence: dict[str, object]) -> _EvidenceSpan:
+        return _EvidenceSpan(
+            address=sentence["address"],
+            doc_index=sentence["doc_index"],
+            start=sentence["start"],
+            end=sentence["end"],
+            score=sentence["score"],
+        )
+
+    positive = [sentence for sentence in sentences if sentence["score"] > 0]
+    if not positive:
+        positive = sentences[: 4 * max_fragments]
+
+    spans: list[_EvidenceSpan] = []
+    pool = positive[:]
+
+    def fits(candidate: _EvidenceSpan) -> bool:
+        return _render_evidence_spans(documents, (*spans, candidate)) <= max_bytes
+
+    while pool and len(spans) < max_fragments:
+        pool.sort(
+            key=lambda sentence: (
+                -sentence["priority"] / (len(documents[sentence["doc_index"]][1][sentence["start"] : sentence["end"]].encode("utf-8")) + _EVIDENCE_ITEM_OVERHEAD_BYTES),
+                -sentence["score"],
+                sentence["doc_index"],
+                sentence["start"],
+            )
+        )
+        chosen_index = next((index for index, sentence in enumerate(pool) if fits(span_of(sentence))), None)
+        if chosen_index is None:
+            break
+        chosen = pool.pop(chosen_index)
+        spans.append(span_of(chosen))
+        for sentence in pool:
+            if sentence["doc_index"] == chosen["doc_index"]:
+                sentence["priority"] = sentence["priority"] * 0.5
+
+    # Widen selected fragments into neighbouring sentences while the budget allows.
+    while True:
+        best_key: tuple[float, int] | None = None
+        best_widened: _EvidenceSpan | None = None
+        best_index = -1
+        for index, span in enumerate(spans):
+            per_doc = doc_sentences[span.doc_index]
+            neighbours = (
+                sentence
+                for sentence in per_doc
+                if sentence is not None and (sentence["end"] <= span.start or sentence["start"] >= span.end)
+            )
+            for sentence in neighbours:
+                if any(
+                    other.doc_index == span.doc_index
+                    and sentence["start"] < other.end
+                    and other.start < sentence["end"]
+                    for position, other in enumerate(spans)
+                    if position != index
+                ):
+                    continue  # already covered by another selected span
+                widened = _EvidenceSpan(
+                    address=span.address,
+                    doc_index=span.doc_index,
+                    start=min(span.start, sentence["start"]),
+                    end=max(span.end, sentence["end"]),
+                    score=span.score + sentence["score"],
+                )
+                remaining = (*spans[:index], *spans[index + 1 :])
+                if _render_evidence_spans(documents, (*remaining, widened)) <= max_bytes:
+                    growth = _evidence_span_bytes(documents, widened) - _evidence_span_bytes(documents, span)
+                    candidate_key = (sentence["score"], -growth)
+                    if best_key is None or candidate_key > best_key:
+                        best_key = candidate_key
+                        best_widened = widened
+                        best_index = index
+        if best_widened is None:
+            break
+        spans = [best_widened if index == best_index else span for index, span in enumerate(spans)]
+
+    merged = _merge_evidence_spans(documents, spans)
+    # Safety clamp: the merge only shrinks output, but never exceed the budget.
+    while merged and _render_evidence_spans(documents, merged) > max_bytes:
+        weakest = min(range(len(merged)), key=lambda index: merged[index].score)
+        merged = tuple(span for index, span in enumerate(merged) if index != weakest)
+    return merged
